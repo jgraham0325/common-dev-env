@@ -9,73 +9,59 @@ def provision_db2_community(root_loc, new_containers)
   config = YAML.load_file("#{root_loc}/dev-env-config/configuration.yml")
   return unless config['applications']
 
-  # Did the container previously exist, if not then we MUST provision regardless of .commodities value
-  new_db_container = false
-  if new_containers.include?('db2_community')
-    new_db_container = true
-    puts colorize_yellow('The DB2 Community container has been newly created - '\
-                         'provision status in .commodities will be ignored')
-  end
-
-  database_initialised = false
-
   config['applications'].each do |appname, _appconfig|
     # To help enforce the accuracy of the app's dependency file, only search for init sql
     # if the app specifically specifies db2_community in it's commodity list
     next unless File.exist?("#{root_loc}/apps/#{appname}/configuration.yml")
     next unless commodity_required?(root_loc, appname, 'db2_community')
 
-    # Load any SQL contained in the apps into the docker commands list
-    if File.exist?("#{root_loc}/apps/#{appname}/fragments/db2-community-init-fragment.sql")
-      database_initialised = process_db2_community_fragment(root_loc, appname, database_initialised, new_db_container)
+    # Load any SQL or shell script contained in the apps into the docker commands list
+    if !Dir.glob("#{root_loc}/apps/#{appname}/fragments/db2-community-init-fragment.*").empty?
+      process_db2_community_fragments(root_loc, appname, new_db_container?(new_containers))
     else
-      puts colorize_yellow("#{appname} says it uses DB2 Community but doesn't contain an init SQL file.
+      puts colorize_yellow("#{appname} says it uses DB2 Community but doesn't contain an init SQL or shell script file.
           Oh well, onwards we go!")
     end
   end
 end
 
-def process_db2_community_fragment(root_loc, appname, database_initialised, new_db_container)
-  result = database_initialised
+def new_db_container?(new_containers)
+  if new_containers.include?('db2_community')
+    puts colorize_yellow('The DB2 Community container has been newly created - '\
+                         'provision status in .commodities will be ignored')
+    true
+  else
+    false
+  end
+end
+
+def process_db2_community_fragments(root_loc, appname, new_db_container)
   puts colorize_pink("Found some in #{appname}")
   if commodity_provisioned?(root_loc, appname, 'db2_community') && !new_db_container
     puts colorize_yellow("DB2 Community has previously been provisioned for #{appname}, skipping")
   else
-    unless database_initialised
-      init_db2_community
-      result = true
+
+    init_db2_community
+
+    begin
+      sql_fragment_full_path = "#{root_loc}/apps/#{appname}/fragments/db2-community-init-fragment.sql"
+      shell_script_fragment_full_path = "#{root_loc}/apps/#{appname}/fragments/db2-community-init-fragment.sh"
+
+      if File.exist?(sql_fragment_full_path)
+        init_db2_community_sql(sql_fragment_full_path, appname)
+      end
+
+      if File.exist?(shell_script_fragment_full_path)
+        init_db2_community_shell_script(shell_script_fragment_full_path, appname)
+      end
+
+      set_commodity_provision_status(root_loc, appname, 'db2_community', true)
+
+    rescue StandardError => e
+      puts colorize_red("#{e.class}: #{e.message}")
+      puts colorize_red(e.backtrace.join("\n"))
+      set_commodity_provision_status(root_loc, appname, 'db2_community', false)
     end
-    init_db2_community_sql(root_loc, appname)
-  end
-  result
-end
-
-def init_db2_community_sql(root_loc, appname)
-  # See comments in provision_postgres.rb for why we are doing it this way
-  run_command('tar -c' \
-              " -C #{root_loc}/apps/#{appname}/fragments" \
-              ' db2-community-init-fragment.sql' \
-              ' | docker cp - db2_community:/')
-
-  run_command('docker exec db2_community bash -c "chmod o+r /db2-community-init-fragment.sql"')
-
-  cmd = 'docker exec -u db2inst1 db2_community bash -c "~/sqllib/bin/db2 -tvf /db2-community-init-fragment.sql"'
-  exit_code = run_command(cmd)
-  # Just in case a fragment hasn't disconnected from it's DB, let's do it now so the next fragment doesn't fail
-  # when doing it's CONNECT TO
-  run_command('docker exec -u db2inst1 db2_community bash -c "~/sqllib/bin/db2 disconnect all"')
-
-  puts colorize_lightblue("Completed #{appname} table sql fragment")
-
-  if ![0, 2, 4, 6].include?(exit_code)
-    # if exit_code != 6 && exit_code != 0 && exit_code != 2 && exit_code != 4
-    puts colorize_red("Something went wrong with the table setup. Exitcode - #{exit_code}")
-  else
-    puts colorize_yellow("Database(s) and Table(s) created correctly. Exitcode - #{exit_code}.\n" \
-                         'Exit code 4 tends to mean Database already exists. 6 - table already exists. 2 - ' \
-                         "index already exists\n" \
-                         'If in doubt read the above output carefully for the exact reason')
-    set_commodity_provision_status(root_loc, appname, 'db2_community', true)
   end
 end
 
@@ -97,4 +83,68 @@ def init_db2_community
   puts colorize_green('DB2 Community is ready')
   # One more sleep to ensure user gets set up
   sleep(7)
+end
+
+def init_db2_community_sql(script_full_path, appname)
+
+  insert_file_into_db2_docker_container(script_full_path)
+
+  file_name = File.basename(script_full_path)
+
+  puts colorize_lightblue("Running #{file_name} for #{appname}")
+
+  exit_code = run_command("docker exec -u db2inst1 db2_community bash -c \"~/sqllib/bin/db2 -tvf /#{file_name}\"")
+
+  disconnect_all_open_db2_connections
+
+  puts colorize_lightblue("Completed #{appname} table sql fragment")
+
+  if ![0, 2, 4, 6].include?(exit_code)
+    # if exit_code != 6 && exit_code != 0 && exit_code != 2 && exit_code != 4
+    puts colorize_red("Something went wrong with the table setup. Exitcode - #{exit_code}")
+    raise "Failed to run init sql for #{appname}"
+  else
+    puts colorize_yellow("Database(s) and Table(s) created correctly. Exitcode - #{exit_code}.\n" \
+                         'Exit code 4 tends to mean Database already exists. 6 - table already exists. 2 - ' \
+                         "index already exists\n" \
+                         'If in doubt read the above output carefully for the exact reason')
+
+  end
+end
+
+def init_db2_community_shell_script(script_full_path, appname)
+
+  insert_file_into_db2_docker_container(script_full_path)
+
+  file_name = File.basename(script_full_path)
+
+  puts colorize_lightblue("Running #{file_name} for #{appname}")
+
+  exit_code = run_command("docker exec -u db2inst1 db2_community bash -c \"./#{file_name}\"")
+
+  disconnect_all_open_db2_connections
+
+  puts colorize_lightblue("Completed #{appname} shell script fragment")
+
+  if exit_code != 0
+    puts colorize_red("Something went wrong with the shell script setup. Exitcode - #{exit_code}")
+    raise "Failed to run init shell script for #{appname}"
+  else
+    puts colorize_yellow("Shell script run correctly. Exit code - #{exit_code}.")
+  end
+end
+
+def insert_file_into_db2_docker_container(host_path)
+  # See comments in provision_postgres.rb for why we are doing it this way
+  host_directory = File.dirname(host_path)
+  file_name = File.basename(host_path)
+
+  run_command("tar -c -C #{host_directory} #{file_name} | docker cp - db2_community:/")
+  run_command("docker exec db2_community bash -c 'chmod o+rx /#{file_name}'")
+end
+
+def disconnect_all_open_db2_connections
+  # Just in case a fragment hasn't disconnected from it's DB, let's do it now so the next fragment doesn't fail
+  # when doing it's CONNECT TO
+  run_command('docker exec -u db2inst1 db2_community bash -c "~/sqllib/bin/db2 disconnect all"')
 end
