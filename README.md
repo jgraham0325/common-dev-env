@@ -164,6 +164,14 @@ This file contains any one-off SQL to run in DB2 - at the minimum it will normal
 
 [Example](snippets/db2-community-init-fragment.sql)
 
+**`/fragments/db2-community-init-fragment.sh`**
+
+This file contains any one-off shell commands to run in DB2. It will be run as db2inst1 user.
+
+Useful for adjusting config settings to avoid errors like SQLCODE: -973, SQLSTATE: 57011, SQLERRMC: PCKCACHESZ
+
+[Example](snippets/db2-community-init-fragment.sh)
+
 ##### ElasticSearch
 
 **`/fragments/elasticsearch-fragment.sh`**
